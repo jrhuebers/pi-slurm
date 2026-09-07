@@ -1,0 +1,23 @@
+{
+  "name": "pi-slurm",
+  "version": "0.1.0",
+  "description": "Slurm job tools for Pi.",
+  "type": "module",
+  "keywords": ["pi-package", "slurm", "hpc"],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/index.ts"]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "typebox": "1.1.3",
+    "@types/node": "25.6.2",
+    "typescript": "6.0.3"
+  }
+}
