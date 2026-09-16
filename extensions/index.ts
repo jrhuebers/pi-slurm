@@ -30,6 +30,7 @@ type TrackedJob = {
 	command: string;
 	workingDirectory: string;
 	partition?: string;
+	qos?: string;
 	logPath: string;
 	submittedAt: string;
 	startedAt?: string;
@@ -46,6 +47,7 @@ type SlurmObservation = {
 
 let jobs = new Map<string, TrackedJob>();
 let monitoring = false;
+let monitoringTimer: ReturnType<typeof setInterval> | undefined;
 
 function run(command: string, args: string[], timeout = 10_000): string {
 	return execFileSync(command, args, {
@@ -107,6 +109,48 @@ function defaultPartition(): string {
 	throw new Error("no unique default Slurm partition; pass partition explicitly");
 }
 
+/**
+ * Resolve a usable QoS when the Slurm account has no DefaultQOS. Sites often
+ * grant several QoS values (for example cpu, gpu, and interactive) and reject
+ * an omitted --qos in that configuration. An explicit tool argument or
+ * PI_RESEARCH_SLURM_QOS always takes precedence over this best-effort lookup.
+ */
+function defaultQos(partition: string): string | undefined {
+	const configured = process.env.PI_RESEARCH_SLURM_QOS?.trim();
+	if (configured) return configured;
+
+	try {
+		const user = run("id", ["-un"]);
+		const output = run("sacctmgr", [
+			"--noheader", "--parsable2", "show", "assoc", "where", `user=${user}`,
+			"format=Partition,QOS,DefaultQOS",
+		]);
+		const associations = output
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => {
+				const [associatedPartition = "", allowed = "", defaultQos = ""] = line.split("|", 3);
+				return {
+					partition: associatedPartition.trim(),
+					allowed: allowed.split(",").map((qos) => qos.trim()).filter(Boolean),
+					defaultQos: defaultQos.trim(),
+				};
+			});
+		const relevant = associations.filter((association) => association.partition === partition);
+		const global = associations.filter((association) => !association.partition);
+		for (const association of [...relevant, ...global]) {
+			if (association.defaultQos) return association.defaultQos;
+			const matchingQos = association.allowed.find((qos) => qos.toLowerCase() === partition.toLowerCase());
+			if (matchingQos) return matchingQos;
+			if (association.allowed.length === 1) return association.allowed[0];
+		}
+	} catch {
+		// Some clusters do not expose accounting queries to users. In that case,
+		// preserve the scheduler's normal default-QoS behavior.
+	}
+	return undefined;
+}
+
 function observe(jobId: string): SlurmObservation {
 	try {
 		const queue = run("squeue", ["--noheader", "--jobs", jobId, "--format=%T|%M|%R"]);
@@ -163,7 +207,7 @@ function notify(pi: ExtensionAPI, content: string, details: Record<string, strin
 function startMonitor(pi: ExtensionAPI): void {
 	if (monitoring) return;
 	monitoring = true;
-	setInterval(() => {
+	monitoringTimer = setInterval(() => {
 		let changed = false;
 		for (const job of jobs.values()) {
 			if (isTerminal(job.lastState)) continue;
@@ -194,6 +238,12 @@ function startMonitor(pi: ExtensionAPI): void {
 }
 
 export default function slurm(pi: ExtensionAPI): void {
+	pi.on("session_shutdown", () => {
+		if (monitoringTimer) clearInterval(monitoringTimer);
+		monitoringTimer = undefined;
+		monitoring = false;
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		restore(ctx);
 		startMonitor(pi);
@@ -203,7 +253,7 @@ export default function slurm(pi: ExtensionAPI): void {
 		name: "slurm_submit",
 		label: "Submit Slurm Job",
 		description: "Submit and track a Slurm job. Uses the selected partition's maximum walltime and sends start/completion notifications.",
-		promptSnippet: "slurm_submit(command, partition?, gpus?, cpus?, mem?, name?, notify_after_minutes?) - submit tracked Slurm work",
+		promptSnippet: "slurm_submit(command, partition?, qos?, gpus?, cpus?, mem?, name?, notify_after_minutes?) - submit tracked Slurm work",
 		promptGuidelines: [
 			"Use slurm_submit for new Slurm work so completion is reported without a polling loop.",
 			"slurm_submit automatically requests the selected partition's maximum walltime; do not use shell sbatch or srun for tracked work.",
@@ -211,6 +261,7 @@ export default function slurm(pi: ExtensionAPI): void {
 		parameters: Type.Object({
 			command: Type.String({ description: "Shell command to run on the allocated node." }),
 			partition: Type.Optional(Type.String({ description: "Slurm partition. Required if no unique default exists." })),
+			qos: Type.Optional(Type.String({ description: "Slurm QoS. By default, resolve the account's partition-matching QoS." })),
 			gpus: Type.Optional(Type.String({ description: "GRES request, for example gpu:1." })),
 			cpus: Type.Optional(Type.String({ description: "CPUs per task, for example 8." })),
 			mem: Type.Optional(Type.String({ description: "Memory request, for example 64G." })),
@@ -220,6 +271,7 @@ export default function slurm(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!hasSlurm()) throw new Error("Slurm is unavailable: sbatch was not found or did not respond.");
 			const partition = params.partition ?? defaultPartition();
+			const qos = params.qos?.trim() || defaultQos(partition);
 			const maxTime = partitionMaxTime(partition);
 			const logs = logRoot();
 			fs.mkdirSync(logs, { recursive: true });
@@ -229,6 +281,7 @@ export default function slurm(pi: ExtensionAPI): void {
 				"--parsable",
 				"--job-name", name,
 				"--partition", partition,
+				...(qos ? ["--qos", qos] : []),
 				"--time", maxTime,
 				"--output", logPath,
 				"--chdir", process.cwd(),
@@ -246,6 +299,7 @@ export default function slurm(pi: ExtensionAPI): void {
 				command: params.command,
 				workingDirectory: process.cwd(),
 				partition,
+				qos,
 				logPath: logPath.replace("%j", jobId),
 				submittedAt: new Date().toISOString(),
 				lastState: "PENDING",
@@ -256,7 +310,7 @@ export default function slurm(pi: ExtensionAPI): void {
 			persist(pi);
 			startMonitor(pi);
 			return {
-				content: [{ type: "text", text: `Submitted ${name} as Slurm job ${job.id}. Partition: ${partition}; walltime: ${maxTime}; log: ${job.logPath}` }],
+				content: [{ type: "text", text: `Submitted ${name} as Slurm job ${job.id}. Partition: ${partition}${qos ? `; QoS: ${qos}` : ""}; walltime: ${maxTime}; log: ${job.logPath}` }],
 				details: {},
 			};
 		},
