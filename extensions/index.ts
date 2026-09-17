@@ -12,7 +12,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATE_ENTRY = "pi-research-engineer-slurm-state";
-const MESSAGE_TYPE = "pi-research-engineer-slurm";
+const MESSAGE_TYPE = "pi-slurm";
 const POLL_INTERVAL_MS = 5_000;
 function logRoot(): string {
 	// A project-local default remains visible from a compute node on clusters
