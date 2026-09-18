@@ -13,6 +13,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 const STATE_ENTRY = "pi-research-engineer-slurm-state";
 const MESSAGE_TYPE = "pi-slurm";
+const EVENT_FINISHED = "slurm:finished";
 const POLL_INTERVAL_MS = 5_000;
 function logRoot(): string {
 	// A project-local default remains visible from a compute node on clusters
@@ -197,6 +198,16 @@ function restore(ctx: ExtensionContext): void {
 	);
 }
 
+function emitFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObservation): void {
+	pi.events.emit(EVENT_FINISHED, {
+		id: job.id,
+		name: job.name,
+		logPath: job.logPath,
+		status: observation.state,
+		detail: observation.detail,
+	});
+}
+
 function notify(pi: ExtensionAPI, content: string, details: Record<string, string> = {}): void {
 	pi.sendMessage(
 		{ customType: MESSAGE_TYPE, content, display: true, details },
@@ -220,6 +231,7 @@ function startMonitor(pi: ExtensionAPI): void {
 					job.startedAt = new Date().toISOString();
 					notify(pi, `[SLURM] ${job.name} (${job.id}) started. Log: ${job.logPath}`, { jobId: job.id, status: "RUNNING" });
 				} else if (observation.terminal) {
+					emitFinished(pi, job, observation);
 					notify(pi, `[SLURM] ${job.name} (${job.id}) ${observation.state.toLowerCase()}: ${observation.detail}. Log: ${job.logPath}`, { jobId: job.id, status: observation.state });
 				}
 			}
