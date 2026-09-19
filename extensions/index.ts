@@ -23,7 +23,19 @@ function logRoot(): string {
 		?? path.join(process.cwd(), ".pi-research-engineer", "slurm");
 }
 
-type JobState = "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED" | "TIMEOUT" | "UNKNOWN";
+type JobState =
+	| "PENDING"
+	| "RUNNING"
+	| "COMPLETED"
+	| "FAILED"
+	| "CANCELLED"
+	| "TIMEOUT"
+	| "DEADLINE"
+	| "REVOKED"
+	| "SPECIAL_EXIT"
+	| "LAUNCH_FAILED"
+	| "INVALID_DEPEND"
+	| "UNKNOWN";
 
 type TrackedJob = {
 	id: string;
@@ -38,6 +50,7 @@ type TrackedJob = {
 	lastState: JobState;
 	notifyAfterMinutes?: number;
 	reminderSent: boolean;
+	completionNotified?: boolean;
 };
 
 type SlurmObservation = {
@@ -49,6 +62,18 @@ type SlurmObservation = {
 let jobs = new Map<string, TrackedJob>();
 let monitoring = false;
 let monitoringTimer: ReturnType<typeof setInterval> | undefined;
+
+const TERMINAL_STATES = new Set<JobState>([
+	"COMPLETED",
+	"FAILED",
+	"CANCELLED",
+	"TIMEOUT",
+	"DEADLINE",
+	"REVOKED",
+	"SPECIAL_EXIT",
+	"LAUNCH_FAILED",
+	"INVALID_DEPEND",
+]);
 
 function run(command: string, args: string[], timeout = 10_000): string {
 	return execFileSync(command, args, {
@@ -73,17 +98,15 @@ function shellQuote(value: string): string {
 
 function normaliseState(value: string): JobState {
 	const state = value.trim().toUpperCase().split(/[ +]/, 1)[0] ?? "UNKNOWN";
-	if (state === "PENDING" || state === "CONFIGURING") return "PENDING";
-	if (state === "RUNNING" || state === "COMPLETING") return "RUNNING";
-	if (state === "COMPLETED") return "COMPLETED";
-	if (state === "CANCELLED") return "CANCELLED";
-	if (state === "TIMEOUT") return "TIMEOUT";
-	if (state === "FAILED" || state === "OUT_OF_MEMORY" || state === "NODE_FAIL" || state === "PREEMPTED" || state === "BOOT_FAIL") return "FAILED";
+	if (["PENDING", "CONFIGURING", "REQUEUED", "REQUEUE_FED", "REQUEUE_HOLD", "RESV_DEL_HOLD", "WAITING", "BEGIN"].includes(state)) return "PENDING";
+	if (["RUNNING", "SUSPENDED", "COMPLETING", "RESIZING", "SIGNALING", "STAGE_OUT", "STOPPED"].includes(state)) return "RUNNING";
+	if (TERMINAL_STATES.has(state as JobState)) return state as JobState;
+	if (["OUT_OF_MEMORY", "NODE_FAIL", "PREEMPTED", "BOOT_FAIL"].includes(state)) return "FAILED";
 	return "UNKNOWN";
 }
 
 function isTerminal(state: JobState): boolean {
-	return state === "COMPLETED" || state === "FAILED" || state === "CANCELLED" || state === "TIMEOUT";
+	return TERMINAL_STATES.has(state);
 }
 
 function partitionMaxTime(partition: string): string {
@@ -158,7 +181,7 @@ function observe(jobId: string): SlurmObservation {
 		if (queue) {
 			const [rawState, elapsed = "-", reason = "-"] = queue.split("|", 3);
 			const state = normaliseState(rawState);
-			return { state, detail: `elapsed=${elapsed}; ${reason}`, terminal: false };
+			if (state !== "UNKNOWN") return { state, detail: `elapsed=${elapsed}; ${reason}`, terminal: isTerminal(state) };
 		}
 	} catch {
 		// A job that left squeue is queried through accounting below.
@@ -169,7 +192,11 @@ function observe(jobId: string): SlurmObservation {
 		if (line) {
 			const [rawState, exitCode = "-", elapsed = "-"] = line.split("|", 3);
 			const state = normaliseState(rawState);
-			return { state, detail: `exit=${exitCode}; elapsed=${elapsed}`, terminal: isTerminal(state) };
+			if (state !== "UNKNOWN") return { state, detail: `exit=${exitCode}; elapsed=${elapsed}`, terminal: isTerminal(state) };
+			// A job present in accounting but absent from squeue has exited. Keep
+			// the raw state in the detail and classify an otherwise new terminal
+			// state as failed so it cannot remain silently unannounced.
+			return { state: "FAILED", detail: `state=${rawState}; exit=${exitCode}; elapsed=${elapsed}`, terminal: true };
 		}
 	} catch {
 		// Scheduler/accounting may be temporarily unavailable.
@@ -199,15 +226,22 @@ function restore(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	// Re-announce terminal jobs after reload/session restore. pi.events is not a
 	// replaying bus, so a sleep tool created after restore would otherwise have
 	// no way to learn that an already-terminal job has finished.
+	let changed = false;
 	for (const job of jobs.values()) {
-		if (isTerminal(job.lastState)) {
-			emitFinished(pi, job, {
-				state: job.lastState,
-				detail: "restored terminal state",
-				terminal: true,
-			});
+		if (!isTerminal(job.lastState)) continue;
+		const observation: SlurmObservation = {
+			state: job.lastState,
+			detail: "restored terminal state",
+			terminal: true,
+		};
+		emitFinished(pi, job, observation);
+		if (!job.completionNotified) {
+			job.completionNotified = true;
+			notifyFinished(pi, job, observation);
+			changed = true;
 		}
 	}
+	if (changed) persist(pi);
 }
 
 function emitFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObservation): void {
@@ -223,7 +257,15 @@ function emitFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObser
 function notify(pi: ExtensionAPI, content: string, details: Record<string, string> = {}): void {
 	pi.sendMessage(
 		{ customType: MESSAGE_TYPE, content, display: true, details },
-		{ triggerTurn: true, deliverAs: "followUp" },
+		{ triggerTurn: true, deliverAs: "steer" },
+	);
+}
+
+function notifyFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObservation): void {
+	notify(
+		pi,
+		`[SLURM] ${job.name} (${job.id}) ${observation.state.toLowerCase()}: ${observation.detail}. Log: ${job.logPath}`,
+		{ jobId: job.id, status: observation.state },
 	);
 }
 
@@ -242,9 +284,10 @@ function startMonitor(pi: ExtensionAPI): void {
 				if (observation.state === "RUNNING" && previous === "PENDING") {
 					job.startedAt = new Date().toISOString();
 					notify(pi, `[SLURM] ${job.name} (${job.id}) started. Log: ${job.logPath}`, { jobId: job.id, status: "RUNNING" });
-				} else if (observation.terminal) {
+				} else if (observation.terminal && !job.completionNotified) {
+					job.completionNotified = true;
 					emitFinished(pi, job, observation);
-					notify(pi, `[SLURM] ${job.name} (${job.id}) ${observation.state.toLowerCase()}: ${observation.detail}. Log: ${job.logPath}`, { jobId: job.id, status: observation.state });
+					notifyFinished(pi, job, observation);
 				}
 			}
 
