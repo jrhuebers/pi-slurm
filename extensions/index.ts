@@ -181,7 +181,7 @@ function persist(pi: ExtensionAPI): void {
 	pi.appendEntry(STATE_ENTRY, { jobs: [...jobs.values()] });
 }
 
-function restore(ctx: ExtensionContext): void {
+function restore(pi: ExtensionAPI, ctx: ExtensionContext): void {
 	const entries = ctx.sessionManager.getEntries() as Array<{
 		type?: string;
 		customType?: string;
@@ -196,6 +196,18 @@ function restore(ctx: ExtensionContext): void {
 			.filter((value): value is TrackedJob => typeof value === "object" && value !== null && typeof (value as TrackedJob).id === "string")
 			.map((job) => [job.id, job]),
 	);
+	// Re-announce terminal jobs after reload/session restore. pi.events is not a
+	// replaying bus, so a sleep tool created after restore would otherwise have
+	// no way to learn that an already-terminal job has finished.
+	for (const job of jobs.values()) {
+		if (isTerminal(job.lastState)) {
+			emitFinished(pi, job, {
+				state: job.lastState,
+				detail: "restored terminal state",
+				terminal: true,
+			});
+		}
+	}
 }
 
 function emitFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObservation): void {
@@ -257,7 +269,7 @@ export default function slurm(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		restore(ctx);
+		restore(pi, ctx);
 		startMonitor(pi);
 	});
 
