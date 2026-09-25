@@ -47,6 +47,7 @@ type TrackedJob = {
 	logPath: string;
 	submittedAt: string;
 	startedAt?: string;
+	startedNotified?: boolean;
 	lastState: JobState;
 	notifyAfterMinutes?: number;
 	reminderSent: boolean;
@@ -57,11 +58,20 @@ type SlurmObservation = {
 	state: JobState;
 	detail: string;
 	terminal: boolean;
+	elapsed?: string;
 };
 
 let jobs = new Map<string, TrackedJob>();
 let monitoring = false;
 let monitoringTimer: ReturnType<typeof setInterval> | undefined;
+let agentRunActive = false;
+
+type PendingNotification = {
+	content: string;
+	details: Record<string, string>;
+};
+
+let pendingNotifications: PendingNotification[] = [];
 
 const TERMINAL_STATES = new Set<JobState>([
 	"COMPLETED",
@@ -107,6 +117,19 @@ function normaliseState(value: string): JobState {
 
 function isTerminal(state: JobState): boolean {
 	return TERMINAL_STATES.has(state);
+}
+
+function hasElapsedTime(value: string | undefined): boolean {
+	if (!value || value === "-") return false;
+	const [dayPart, clockPart] = value.split("-", 2).length === 2 ? value.split("-", 2) : ["0", value];
+	const clock = clockPart.split(":").map(Number);
+	if (!Number.isFinite(Number(dayPart)) || clock.some((part) => !Number.isFinite(part))) return false;
+	const seconds = clock.length === 3
+		? clock[0] * 3600 + clock[1] * 60 + clock[2]
+		: clock.length === 2
+			? clock[0] * 60 + clock[1]
+			: clock[0] ?? 0;
+	return Number(dayPart) * 86_400 + seconds > 0;
 }
 
 function partitionMaxTime(partition: string): string {
@@ -181,7 +204,7 @@ function observe(jobId: string): SlurmObservation {
 		if (queue) {
 			const [rawState, elapsed = "-", reason = "-"] = queue.split("|", 3);
 			const state = normaliseState(rawState);
-			if (state !== "UNKNOWN") return { state, detail: `elapsed=${elapsed}; ${reason}`, terminal: isTerminal(state) };
+			if (state !== "UNKNOWN") return { state, detail: `elapsed=${elapsed}; ${reason}`, terminal: isTerminal(state), elapsed };
 		}
 	} catch {
 		// A job that left squeue is queried through accounting below.
@@ -192,7 +215,7 @@ function observe(jobId: string): SlurmObservation {
 		if (line) {
 			const [rawState, exitCode = "-", elapsed = "-"] = line.split("|", 3);
 			const state = normaliseState(rawState);
-			if (state !== "UNKNOWN") return { state, detail: `exit=${exitCode}; elapsed=${elapsed}`, terminal: isTerminal(state) };
+			if (state !== "UNKNOWN") return { state, detail: `exit=${exitCode}; elapsed=${elapsed}`, terminal: isTerminal(state), elapsed };
 			// A job present in accounting but absent from squeue has exited. Keep
 			// the raw state in the detail and classify an otherwise new terminal
 			// state as failed so it cannot remain silently unannounced.
@@ -254,11 +277,50 @@ function emitFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObser
 	});
 }
 
-function notify(pi: ExtensionAPI, content: string, details: Record<string, string> = {}): void {
+function sendNotification(pi: ExtensionAPI, notification: PendingNotification): void {
 	pi.sendMessage(
-		{ customType: MESSAGE_TYPE, content, display: true, details },
-		{ triggerTurn: true, deliverAs: "steer" },
+		{
+			customType: MESSAGE_TYPE,
+			content: notification.content,
+			display: true,
+			details: notification.details,
+		},
+		{ triggerTurn: true },
 	);
+}
+
+function flushNotificationsAtBoundary(): { entries: Array<{ type: "custom_message"; customType: string; content: string; display: boolean; details: Record<string, string> }>; continue: boolean } | undefined {
+	if (pendingNotifications.length === 0) return undefined;
+	const notifications = pendingNotifications;
+	pendingNotifications = [];
+	return {
+		entries: notifications.map((notification) => ({
+			type: "custom_message" as const,
+			customType: MESSAGE_TYPE,
+			content: notification.content,
+			display: true,
+			details: notification.details,
+		})),
+		continue: true,
+	};
+}
+
+function flushNotificationsWhenIdle(pi: ExtensionAPI): void {
+	const notifications = pendingNotifications;
+	pendingNotifications = [];
+	for (const notification of notifications) sendNotification(pi, notification);
+}
+
+function notify(pi: ExtensionAPI, content: string, details: Record<string, string> = {}): void {
+	const notification = { content, details };
+	if (agentRunActive) {
+		// Do not use the interactive steer queue. Boundary drafts are injected into
+		// the next model request in this run and can never be restored into Pi's
+		// text editor as user input.
+		pendingNotifications.push(notification);
+		return;
+	}
+	sendNotification(pi, notification);
 }
 
 function notifyFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObservation): void {
@@ -283,8 +345,15 @@ function startMonitor(pi: ExtensionAPI): void {
 				changed = true;
 				if (observation.state === "RUNNING" && previous === "PENDING") {
 					job.startedAt = new Date().toISOString();
+					job.startedNotified = true;
 					notify(pi, `[SLURM] ${job.name} (${job.id}) started. Log: ${job.logPath}`, { jobId: job.id, status: "RUNNING" });
-				} else if (observation.terminal && !job.completionNotified) {
+				} else if (observation.terminal && !job.startedNotified && hasElapsedTime(observation.elapsed)) {
+					// A short job can enter and leave RUNNING between polls. A non-zero
+					// elapsed time proves it ran, so do not lose its start notification.
+					job.startedNotified = true;
+					notify(pi, `[SLURM] ${job.name} (${job.id}) started. Log: ${job.logPath}`, { jobId: job.id, status: "RUNNING" });
+				}
+				if (observation.terminal && !job.completionNotified) {
 					job.completionNotified = true;
 					emitFinished(pi, job, observation);
 					notifyFinished(pi, job, observation);
@@ -305,10 +374,23 @@ function startMonitor(pi: ExtensionAPI): void {
 }
 
 export default function slurm(pi: ExtensionAPI): void {
+	pi.on("agent_start", () => {
+		agentRunActive = true;
+	});
+
+	pi.on("agent_before_settle", () => flushNotificationsAtBoundary());
+
+	pi.on("agent_settled", () => {
+		agentRunActive = false;
+		flushNotificationsWhenIdle(pi);
+	});
+
 	pi.on("session_shutdown", () => {
 		if (monitoringTimer) clearInterval(monitoringTimer);
 		monitoringTimer = undefined;
 		monitoring = false;
+		agentRunActive = false;
+		pendingNotifications = [];
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
