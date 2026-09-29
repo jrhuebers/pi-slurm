@@ -15,12 +15,11 @@ const STATE_ENTRY = "pi-research-engineer-slurm-state";
 const MESSAGE_TYPE = "pi-slurm";
 const EVENT_FINISHED = "slurm:finished";
 const POLL_INTERVAL_MS = 5_000;
-function logRoot(): string {
-	// A project-local default remains visible from a compute node on clusters
-	// where /tmp is node-local. Override when a different shared location is
-	// appropriate for the site.
+function logRoot(runDirectory: string): string {
+	// Keep logs in the agent's run directory so they remain alongside the work
+	// that submitted them and are visible from compute nodes on shared storage.
 	return process.env.PI_RESEARCH_SLURM_LOG_DIR
-		?? path.join(process.cwd(), ".pi-research-engineer", "slurm");
+		?? path.join(runDirectory, "slurm-logs");
 }
 
 type JobState =
@@ -422,7 +421,7 @@ export default function slurm(pi: ExtensionAPI): void {
 			const partition = params.partition ?? defaultPartition();
 			const qos = params.qos?.trim() || defaultQos(partition);
 			const maxTime = partitionMaxTime(partition);
-			const logs = logRoot();
+			const logs = logRoot(ctx.cwd);
 			fs.mkdirSync(logs, { recursive: true });
 			const name = params.name?.trim() || "pi-research";
 			const logPath = path.join(logs, `${name}-%j.out`);
@@ -433,7 +432,7 @@ export default function slurm(pi: ExtensionAPI): void {
 				...(qos ? ["--qos", qos] : []),
 				"--time", maxTime,
 				"--output", logPath,
-				"--chdir", process.cwd(),
+				"--chdir", ctx.cwd,
 				...(params.gpus ? ["--gres", params.gpus] : []),
 				...(params.cpus ? ["--cpus-per-task", params.cpus] : []),
 				...(params.mem ? ["--mem", params.mem] : []),
@@ -446,7 +445,7 @@ export default function slurm(pi: ExtensionAPI): void {
 				id: jobId,
 				name,
 				command: params.command,
-				workingDirectory: process.cwd(),
+				workingDirectory: ctx.cwd,
 				partition,
 				qos,
 				logPath: logPath.replace("%j", jobId),
