@@ -5,7 +5,8 @@
   "type": "module",
   "keywords": ["pi-package", "slurm", "hpc"],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

@@ -63,14 +63,6 @@ type SlurmObservation = {
 let jobs = new Map<string, TrackedJob>();
 let monitoring = false;
 let monitoringTimer: ReturnType<typeof setInterval> | undefined;
-let agentRunActive = false;
-
-type PendingNotification = {
-	content: string;
-	details: Record<string, string>;
-};
-
-let pendingNotifications: PendingNotification[] = [];
 
 const TERMINAL_STATES = new Set<JobState>([
 	"COMPLETED",
@@ -276,50 +268,14 @@ function emitFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObser
 	});
 }
 
-function sendNotification(pi: ExtensionAPI, notification: PendingNotification): void {
-	pi.sendMessage(
-		{
-			customType: MESSAGE_TYPE,
-			content: notification.content,
-			display: true,
-			details: notification.details,
-		},
-		{ triggerTurn: true },
-	);
-}
-
-function flushNotificationsAtBoundary(): { entries: Array<{ type: "custom_message"; customType: string; content: string; display: boolean; details: Record<string, string> }>; continue: boolean } | undefined {
-	if (pendingNotifications.length === 0) return undefined;
-	const notifications = pendingNotifications;
-	pendingNotifications = [];
-	return {
-		entries: notifications.map((notification) => ({
-			type: "custom_message" as const,
-			customType: MESSAGE_TYPE,
-			content: notification.content,
-			display: true,
-			details: notification.details,
-		})),
-		continue: true,
-	};
-}
-
-function flushNotificationsWhenIdle(pi: ExtensionAPI): void {
-	const notifications = pendingNotifications;
-	pendingNotifications = [];
-	for (const notification of notifications) sendNotification(pi, notification);
-}
-
 function notify(pi: ExtensionAPI, content: string, details: Record<string, string> = {}): void {
-	const notification = { content, details };
-	if (agentRunActive) {
-		// Do not use the interactive steer queue. Boundary drafts are injected into
-		// the next model request in this run and can never be restored into Pi's
-		// text editor as user input.
-		pendingNotifications.push(notification);
-		return;
-	}
-	sendNotification(pi, notification);
+	pi.sendMessage(
+		{ customType: MESSAGE_TYPE, content, display: true, details },
+		// Queue into the active run when streaming. In particular, never flush a
+		// triggerTurn notification from agent_settled: the low-level agent can
+		// still be processing, even though the session reports itself idle.
+		{ triggerTurn: true, deliverAs: "steer" },
+	);
 }
 
 function notifyFinished(pi: ExtensionAPI, job: TrackedJob, observation: SlurmObservation): void {
@@ -373,23 +329,10 @@ function startMonitor(pi: ExtensionAPI): void {
 }
 
 export default function slurm(pi: ExtensionAPI): void {
-	pi.on("agent_start", () => {
-		agentRunActive = true;
-	});
-
-	pi.on("agent_before_settle", () => flushNotificationsAtBoundary());
-
-	pi.on("agent_settled", () => {
-		agentRunActive = false;
-		flushNotificationsWhenIdle(pi);
-	});
-
 	pi.on("session_shutdown", () => {
 		if (monitoringTimer) clearInterval(monitoringTimer);
 		monitoringTimer = undefined;
 		monitoring = false;
-		agentRunActive = false;
-		pendingNotifications = [];
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
