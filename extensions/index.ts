@@ -78,6 +78,9 @@ const TERMINAL_STATES = new Set<JobState>([
 
 function run(command: string, args: string[], timeout = 10_000): string {
 	return execFileSync(command, args, {
+		// Explicit pipes prevent execFileSync from echoing failed commands' stderr
+		// into Pi's terminal, bypassing the TUI. Errors still carry captured stderr.
+		stdio: ["pipe", "pipe", "pipe"],
 		encoding: "utf8",
 		timeout,
 		maxBuffer: 1024 * 1024,
