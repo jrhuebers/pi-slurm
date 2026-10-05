@@ -41,6 +41,7 @@ type TrackedJob = {
 	name: string;
 	command: string;
 	workingDirectory: string;
+	comment?: string;
 	partition?: string;
 	qos?: string;
 	logPath: string;
@@ -347,7 +348,7 @@ export default function slurm(pi: ExtensionAPI): void {
 		name: "slurm_submit",
 		label: "Submit Slurm Job",
 		description: "Submit and track a Slurm job. Uses the selected partition's maximum walltime and sends start/completion notifications.",
-		promptSnippet: "slurm_submit(command, partition?, qos?, gpus?, cpus?, mem?, name?, notify_after_minutes?) - submit tracked Slurm work",
+		promptSnippet: "slurm_submit(command, partition?, qos?, gpus?, cpus?, mem?, name?, comment?, notify_after_minutes?) - submit tracked Slurm work",
 		promptGuidelines: [
 			"Use slurm_submit for new Slurm work so completion is reported without a polling loop.",
 			"slurm_submit automatically requests the selected partition's maximum walltime; do not use shell sbatch or srun for tracked work.",
@@ -360,6 +361,7 @@ export default function slurm(pi: ExtensionAPI): void {
 			cpus: Type.Optional(Type.String({ description: "CPUs per task, for example 8." })),
 			mem: Type.Optional(Type.String({ description: "Memory request, for example 64G." })),
 			name: Type.Optional(Type.String({ description: "Human-readable job name." })),
+			comment: Type.Optional(Type.String({ description: "Slurm job comment. Defaults to the agent's working-directory basename." })),
 			notify_after_minutes: Type.Optional(Type.Number({ minimum: 1, description: "Optional one-off reminder after this many minutes." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -370,10 +372,12 @@ export default function slurm(pi: ExtensionAPI): void {
 			const logs = logRoot(ctx.cwd);
 			fs.mkdirSync(logs, { recursive: true });
 			const name = params.name?.trim() || "pi-research";
+			const comment = params.comment ?? path.basename(path.resolve(ctx.cwd));
 			const logPath = path.join(logs, `${name}-%j.out`);
 			const args = [
 				"--parsable",
 				"--job-name", name,
+				"--comment", comment,
 				"--partition", partition,
 				...(qos ? ["--qos", qos] : []),
 				"--time", maxTime,
@@ -392,6 +396,7 @@ export default function slurm(pi: ExtensionAPI): void {
 				name,
 				command: params.command,
 				workingDirectory: ctx.cwd,
+				comment,
 				partition,
 				qos,
 				logPath: logPath.replace("%j", jobId),
